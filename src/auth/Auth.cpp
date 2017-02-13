@@ -20,8 +20,10 @@
 
 #include "Auth.h"
 #include "Constants.h"
+#include "Configuration.h"
 #include "AuthMessages.h"
 #include "SafeDataStream.h"
+#include "Utils.h"
 
 #include <QtCore/QProcess>
 #include <QtCore/QUuid>
@@ -57,6 +59,7 @@ namespace SDDM {
         void dataPending();
         void childExited(int exitCode, QProcess::ExitStatus exitStatus);
         void childError(QProcess::ProcessError error);
+        void cancelPamConv();
         void requestFinished();
     public:
         AuthRequest *request { nullptr };
@@ -115,25 +118,12 @@ namespace SDDM {
             , id(lastId++) {
         SocketServer::instance()->helpers[id] = this;
         QProcessEnvironment env = child->processEnvironment();
-        bool langEmpty = true;
-        QFile localeFile(QStringLiteral("/etc/locale.conf"));
-        if (localeFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            QTextStream in(&localeFile);
-            while (!in.atEnd()) {
-                QStringList parts = in.readLine().split(QLatin1Char('='));
-                if (parts.size() >= 2) {
-                    env.insert(parts[0], parts[1]);
-                    if (parts[0] == QLatin1String("LANG"))
-                        langEmpty = false;
-                }
-            }
-            localeFile.close();
-        }
-        if (langEmpty)
-            env.insert(QStringLiteral("LANG"), QStringLiteral("C"));
+        // read locale settings from distro specific file, default /etc/locale.conf
+        Utils::readLocaleFile(env, mainConfig.LocaleFile.get());
         child->setProcessEnvironment(env);
         connect(child, QOverload<int,QProcess::ExitStatus>::of(&QProcess::finished), this, &Auth::Private::childExited);
         connect(child, &QProcess::errorOccurred, this, &Auth::Private::childError);
+        connect(request, &AuthRequest::canceled, this, &Auth::Private::cancelPamConv);
         connect(request, &AuthRequest::finished, this, &Auth::Private::requestFinished);
         connect(request, &AuthRequest::promptsChanged, parent, &Auth::requestChanged);
     }
@@ -149,6 +139,7 @@ namespace SDDM {
         connect(socket, &QLocalSocket::readyRead, this, &Auth::Private::dataPending);
     }
 
+    // from (PAM) Backend to daemon
     void Auth::Private::dataPending() {
         Auth *auth = qobject_cast<Auth*>(parent());
         Msg m = MSG_UNKNOWN;
@@ -158,23 +149,27 @@ namespace SDDM {
             str >> m;
             switch (m) {
                 case ERROR: {
+                    int result;
                     QString message;
-                    Error type = ERROR_NONE;
-                    str >> message >> type;
-                    Q_EMIT auth->error(message, type);
+                    Auth::Error type = Auth::ERROR_NONE;
+                    str >> message >> type >> result;
+                    Q_EMIT auth->error(message, type, result);
                     break;
                 }
                 case INFO: {
+                    int result;
                     QString message;
-                    Info type = INFO_NONE;
-                    str >> message >> type;
-                    Q_EMIT auth->info(message, type);
+                    Auth::Info type = Auth::INFO_NONE;
+                    str >> message >> type >> result;
+                    Q_EMIT auth->info(message, type, result);
                     break;
                 }
+                // request from (PAM) Backend
                 case REQUEST: {
                     Request r;
                     str >> r;
                     request->setRequest(&r);
+                    qDebug() << "Auth: Request received";
                     break;
                 }
                 case AUTHENTICATED: {
@@ -211,7 +206,8 @@ namespace SDDM {
                     break;
                 }
                 default: {
-                    Q_EMIT auth->error(QStringLiteral("Auth: Unexpected value received: %1").arg(m), ERROR_INTERNAL);
+                    qWarning("Auth: dataPending:  Unknown message received: %d", m);
+                    Q_EMIT auth->error(QStringLiteral("Auth: Unexpected value received: %1").arg(m), Auth::ERROR_INTERNAL, 0);
                 }
             }
         }
@@ -219,10 +215,10 @@ namespace SDDM {
 
     void Auth::Private::childExited(int exitCode, QProcess::ExitStatus exitStatus) {
         if (exitStatus != QProcess::NormalExit) {
-            qWarning("Auth: sddm-helper (%s) crashed (exit code %d)",
+            qWarning("Auth: sddm-helper (%s) crashed (exit status %d, exit code %d)",
                      qPrintable(child->arguments().join(QLatin1Char(' '))),
-                     HelperExitStatus(exitStatus));
-            Q_EMIT qobject_cast<Auth*>(parent())->error(child->errorString(), ERROR_INTERNAL);
+                     Auth::HelperExitStatus(exitStatus), exitCode);
+            Q_EMIT qobject_cast<Auth*>(parent())->error(child->errorString(), Auth::ERROR_INTERNAL, 0);
         }
 
         if (exitCode == HELPER_SUCCESS)
@@ -235,9 +231,19 @@ namespace SDDM {
 
     void Auth::Private::childError(QProcess::ProcessError error) {
         Q_UNUSED(error);
-        Q_EMIT qobject_cast<Auth*>(parent())->error(child->errorString(), ERROR_INTERNAL);
+        Q_EMIT qobject_cast<Auth*>(parent())->error(child->errorString(), ERROR_INTERNAL, 0);
     }
 
+    // from daemon to (PAM) backend
+    void Auth::Private::cancelPamConv() {
+        SafeDataStream str(socket);
+        qDebug() << "Auth: cancelPamConv, send CANCEL to backend";
+        str << CANCEL;
+        str.send();
+        request->setRequest();
+    }
+
+    // from daemon to (PAM) backend
     void Auth::Private::requestFinished() {
         SafeDataStream str(socket);
         Request r = request->request();
@@ -245,7 +251,6 @@ namespace SDDM {
         str.send();
         request->setRequest();
     }
-
 
     Auth::Auth(const QString &user, const QString &session, bool autologin, QObject *parent, bool verbose)
             : QObject(parent)

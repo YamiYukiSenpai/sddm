@@ -1,5 +1,6 @@
 /***************************************************************************
 * Copyright (c) 2013 Abdurrahman AVCI <abdurrahmanavci@gmail.com>
+* Copyright (c) 2018 Thomas Höhn <thomas_hoehn@gmx.net>
 *
 * This program is free software; you can redistribute it and/or modify
 * it under the terms of the GNU General Public License as published by
@@ -250,6 +251,8 @@ namespace SDDM {
         } else {
             m_auth->stop();
         }
+
+        emit stopped();
     }
 
     void Greeter::finished() {
@@ -268,6 +271,8 @@ namespace SDDM {
             m_process->deleteLater();
             m_process = nullptr;
         }
+
+        emit stopped();
     }
 
     void Greeter::onRequestChanged() {
@@ -316,6 +321,8 @@ namespace SDDM {
         } else if (status == Auth::HELPER_SESSION_ERROR) {
             Q_EMIT failed();
         }
+
+        emit stopped();
     }
 
     bool Greeter::isRunning() const {
@@ -337,13 +344,15 @@ namespace SDDM {
         }
     }
 
-    void Greeter::authInfo(const QString &message, Auth::Info info) {
+    void Greeter::authInfo(const QString &message, Auth::Info info, int result) {
         Q_UNUSED(info);
+        Q_UNUSED(result);
         qDebug() << "Information from greeter session:" << message;
     }
 
-    void Greeter::authError(const QString &message, Auth::Error error) {
+    void Greeter::authError(const QString &message, Auth::Error error, int result) {
         Q_UNUSED(error);
+        Q_UNUSED(result);
         qWarning() << "Error from greeter session:" << message;
     }
 }
